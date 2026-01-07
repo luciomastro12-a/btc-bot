@@ -1,62 +1,67 @@
-# BTC Bot (GitHub Actions) - diario 365d + mensual (últimos 24 meses aprox) via CoinGecko
+# BTC Bot (GitHub Actions) - DIARIO 365d + MENSUAL (24m) usando CryptoCompare (sin API key)
 # Env vars requeridas:
 #   TELEGRAM_TOKEN
 #   TELEGRAM_CHAT_ID
 
 import os
-import math
 import requests
 import numpy as np
 from datetime import datetime, timezone
-
-COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-VS = "usd"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 
-def fetch_prices(days: str | int):
+def fetch_daily_cryptocompare(limit: int = 2000):
     """
-    days: 365, 730, "max"
-    return: list of (datetime_utc, price_float)
+    CryptoCompare: datos diarios BTC/USD.
+    Devuelve lista de (datetime_utc, close_price)
     """
-    params = {"vs_currency": VS, "days": str(days), "interval": "daily"}
-    r = requests.get(COINGECKO_URL, params=params, timeout=30)
+    url = "https://min-api.cryptocompare.com/data/v2/histoday"
+    params = {
+        "fsym": "BTC",
+        "tsym": "USD",
+        "limit": limit,  # cantidad de días hacia atrás (incluye el día actual con cierre parcial)
+    }
+    r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     data = r.json()
-    raw = data.get("prices", [])
+
+    if data.get("Response") != "Success":
+        raise RuntimeError(f"CryptoCompare error: {data.get('Message', 'Unknown')}")
+
+    rows = data["Data"]["Data"]
     out = []
-    for ts_ms, price in raw:
-        dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-        out.append((dt, float(price)))
-    if len(out) < 30:
-        raise RuntimeError("No se pudieron obtener suficientes datos desde CoinGecko.")
+    for row in rows:
+        # row: {"time":..., "close":...}
+        dt = datetime.fromtimestamp(int(row["time"]), tz=timezone.utc)
+        price = float(row["close"])
+        out.append((dt, price))
+
+    # limpiar posibles ceros
+    out = [(dt, p) for dt, p in out if p > 0]
+    if len(out) < 400:
+        raise RuntimeError("No se pudieron obtener suficientes datos diarios desde CryptoCompare.")
     return out
 
 
-def last_365_daily(prices):
-    # prices ya viene daily. Tomamos los últimos 366 para poder tener 365 diffs.
-    return prices[-366:]
+def last_n(prices, n: int):
+    return prices[-n:]
 
 
 def monthly_series_from_daily(prices, months=24):
     """
-    De daily -> mensual: toma el último precio disponible de cada mes.
-    Devuelve últimos `months` meses.
+    De daily -> mensual: toma el último close disponible de cada mes.
     """
-    by_month = {}  # (y,m) -> (dt, price) del último día
+    by_month = {}
     for dt, p in prices:
         key = (dt.year, dt.month)
-        # nos quedamos con el último día del mes
         if key not in by_month or dt > by_month[key][0]:
             by_month[key] = (dt, p)
 
     keys_sorted = sorted(by_month.keys())
     series = [(by_month[k][0], by_month[k][1]) for k in keys_sorted]
-    # últimos N meses
-    series = series[-months:]
-    return series
+    return series[-months:]
 
 
 def analizar_precios(precios: np.ndarray, etiqueta: str) -> dict:
@@ -129,7 +134,6 @@ def senal_combinada(res_m: dict, res_d: dict) -> str:
     if mensual_bajista and diario_alcista:
         return "🧩 SEÑAL COMBINADA: 🚨 Macro bajista, pero diario alcista (rebote contra tendencia)"
 
-    # si mensual no es fuerte
     if res_m["pendiente"] > 0:
         return "🧩 SEÑAL COMBINADA: 📈 Sesgo macro alcista (no fuerte), diario mixto"
     if res_m["pendiente"] < 0:
@@ -182,24 +186,19 @@ def send_telegram(text: str):
 
 
 def main():
-    # 1) Daily data (para diario + para armar mensual)
-    all_daily = fetch_prices("730")
+    all_daily = fetch_daily_cryptocompare(limit=2000)
 
-    # DIARIO 365d
-    daily_365 = last_365_daily(all_daily)
+    daily_365 = last_n(all_daily, 366)
     precios_d = np.array([p for _, p in daily_365], dtype=float)
     res_d = analizar_precios(precios_d, "DIARIO (365d)")
 
-    # MENSUAL (últimos 24 meses aprox, desde daily max)
     mensual = monthly_series_from_daily(all_daily, months=24)
     precios_m = np.array([p for _, p in mensual], dtype=float)
     res_m = analizar_precios(precios_m, "MENSUAL (24m)")
 
-    # Señal + alertas
     senal = senal_combinada(res_m, res_d)
     alertas = generar_alertas(res_m, res_d)
 
-    # Mensaje
     mensaje = "📊 BTC ANALYSIS BOT\n\n"
     mensaje += resumen(res_m) + "\n"
     mensaje += resumen(res_d) + "\n"
